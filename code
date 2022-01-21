@@ -1,0 +1,226 @@
+METHOD /bobf/if_frw_determination~execute.
+
+    TYPES: BEGIN OF ty_itemtr,
+             zztm_btype  TYPE ztme_btype,
+             gro_wei_val TYPE /scmtms/qua_gro_wei_val,
+             tures_tco   TYPE /scmtms/equip_type,
+           END OF ty_itemtr.
+
+    DATA:lt_root       TYPE /scmtms/t_tor_root_k,
+         lt_fu         TYPE /scmtms/t_tor_root_k,
+         lt_item       TYPE /scmtms/t_tor_item_tr_k,
+         lt_key        TYPE /bobf/t_frw_key,
+         lt_key_itm    TYPE /bobf/t_frw_key,
+         lt_itemtr     TYPE STANDARD TABLE OF ty_itemtr,
+         lt_failed_key TYPE /bobf/t_frw_key,
+         lt_tcc_root   TYPE /scmtms/t_tcc_root_k.
+
+    DATA:ls_msg        TYPE symsg,
+         ls_failed_key TYPE /bobf/s_frw_key.
+
+    DATA:lv_volva  TYPE /scmtms/qua_gro_vol_val,
+         lv_weiva  TYPE /scmtms/qua_gro_wei_val,
+         lv_incomp TYPE boolean,
+         lv_capvo  TYPE /scmtms/qua_gro_vol_val,
+         lv_capwe  TYPE /scmtms/qua_gro_wei_val,
+         lv_check  TYPE boolean,
+         lv_godva  TYPE /scmtms/amt_goodsvalue_val.
+
+    DATA:lo_parameters TYPE REF TO /scmtms/s_tcc_calc_base_param,
+         lo_change     TYPE REF TO /bobf/if_tra_change,
+         lo_message    TYPE REF TO /bobf/if_frw_message.
+
+    IF sy-uname = 'RAPRECIADO'.
+*  5555555555 Obtener indicador de incompatibilidad.
+      GET PARAMETER ID 'MESSA' FIELD lv_incomp.
+
+      TRY.
+          io_read->retrieve( EXPORTING
+                                   iv_node = is_ctx-node_key
+                                   it_key = it_key
+                                   iv_fill_data = abap_true
+                             IMPORTING
+                                   et_data = lt_root ).
+
+          IF lines( lt_root ) GT 0.
+
+            DATA(ls_root) = lt_root[ 1 ].
+
+*  Las validaciones a continuación solo deben realizarse
+*  si el TOR_TYPE del OF está en la tabla 4
+            SELECT tor_type
+              INTO TABLE @DATA(lt_orden)
+              FROM zttm_tp_ordem
+             WHERE tor_type EQ @ls_root-tor_type.
+
+            IF lt_orden IS NOT INITIAL.
+
+*  Luego debemos buscar el porcentaje de ocupación.
+*  Para ello, debemos buscar los campos para acceder
+*  a la tabla 1, y traer el campo de porcentaje:
+
+              io_read->retrieve_by_association(
+                EXPORTING
+                  iv_node                 = is_ctx-node_key
+                  it_key                  = it_key
+                  iv_association          = /scmtms/if_tor_c=>sc_association-root-assigned_fus
+                  iv_fill_data            = abap_false
+                IMPORTING
+                  et_target_key           = lt_key
+              ).
+
+              io_read->retrieve(
+                EXPORTING
+                  iv_node = is_ctx-node_key
+                  it_key = lt_key
+                  iv_fill_data = abap_true
+               IMPORTING
+                  et_data = lt_fu ).
+
+              LOOP AT lt_fu INTO DATA(ls_fu).
+
+                TRY.
+
+                    lt_key_itm = VALUE #( ( key = ls_fu-key ) ).
+
+                    io_read->retrieve_by_association(
+                      EXPORTING
+                        iv_node                 = is_ctx-node_key
+                        it_key                  = lt_key_itm
+                        iv_association          = /scmtms/if_tor_c=>sc_association-root-item_tr
+                        iv_fill_data            = abap_true
+                      IMPORTING
+                        et_data                 = lt_item
+                    ).
+
+                    TRY.
+                        DATA(lv_tures_tco) = lt_item[ item_cat = 'AVR' ]-tures_tco.
+                      CATCH cx_sy_itab_line_not_found.
+                    ENDTRY.
+
+                    APPEND VALUE #( zztm_btype = ls_fu-zztm_btype
+                                    gro_wei_val = REDUCE #( INIT x TYPE /scmtms/qua_gro_wei_val
+                                                             FOR ls_item IN lt_item
+                                                            NEXT x = x + ls_item-gro_wei_val )
+                                    tures_tco = lv_tures_tco
+                                  ) TO lt_itemtr.
+
+                    lv_volva = lv_volva + REDUCE #( INIT x TYPE /scmtms/qua_gro_vol_val
+                                                     FOR ls_item IN lt_item
+                                                   WHERE ( item_cat EQ 'PRD' AND main_cargo_item EQ 'X' )
+                                                    NEXT x = x + ls_item-gro_vol_val ).
+
+                    lv_weiva = lv_weiva + REDUCE #( INIT y TYPE /scmtms/qua_gro_wei_val
+                                                     FOR ls_item IN lt_item
+                                                   WHERE ( item_cat EQ 'PRD' AND main_cargo_item EQ 'X' )
+                                                    NEXT y = y + ls_item-gro_wei_val ).
+
+                    lv_godva = lv_godva + REDUCE #( INIT z TYPE /scmtms/amt_goodsvalue_val
+                                                     FOR ls_item IN lt_item
+                                                   WHERE ( item_cat EQ 'PRD' AND main_cargo_item EQ 'X' )
+                                                    NEXT z = z + ls_item-amt_gdsv_val ).
+
+                    TRY.
+                        DATA(ls_capva) = lt_item[ item_cat = 'AVR' ].
+
+                        lv_capvo = ls_capva-gro_vol_valcap.
+                        lv_capwe = ls_capva-gro_wei_valcap.
+
+                      CATCH cx_sy_itab_line_not_found.
+                    ENDTRY.
+
+                  CATCH cx_sy_itab_line_not_found.
+                ENDTRY.
+              ENDLOOP.
+
+              SORT lt_itemtr BY gro_wei_val DESCENDING.
+              DATA(ls_itemtr) = lt_itemtr[ 1 ].
+
+              SELECT SINGLE
+                     zzpercent
+                INTO @DATA(lv_minpo)
+                FROM zttm_porce_min
+               WHERE zztm_btype EQ @ls_itemtr-zztm_btype
+                 AND tures_tco  EQ @ls_itemtr-tures_tco.
+
+              IF lv_minpo IS NOT INITIAL.
+
+                DATA(lv_volpo) = ( lv_volva * 100 ) / lv_capvo.
+                DATA(lv_weipo) = ( lv_weiva * 100 ) / lv_capwe.
+
+                IF lv_volpo LT lv_minpo  AND lv_weipo LT lv_minpo.
+                  lv_check = abap_true.
+                ENDIF.
+
+              ENDIF.
+            ENDIF.
+
+            IF lv_incomp = abap_true OR lv_check = abap_true.
+*Validação flete venta:
+
+              DATA(lo_actio) = /bobf/cl_tra_serv_mgr_factory=>get_service_manager( /scmtms/if_tor_c=>sc_bo_key ).
+              CREATE DATA lo_parameters.
+*              lo_parameters->do_modifications_only = abap_true.
+*              lo_parameters->calc_context = 'CQ'.
+
+              lo_actio->do_action( EXPORTING
+                                       iv_act_key = /scmtms/if_tor_c=>sc_action-root-calc_transportation_charges
+                                       it_key = it_key
+*                                    is_parameters = Action Parameters if available & required
+                                   IMPORTING
+                                       eo_change = lo_change
+                                       eo_message = lo_message
+                                       et_failed_key = lt_failed_key ).
+
+              io_read->retrieve_by_association(
+                      EXPORTING
+                        iv_node                 = is_ctx-node_key
+                        it_key                  = it_key
+                        iv_association          = /scmtms/if_tor_c=>sc_association-root-transportcharges
+                        iv_fill_data            = abap_true
+                      IMPORTING
+                        et_data                 = lt_tcc_root
+                    ).
+
+              DATA(lv_amoun) = lt_tcc_root[ 1 ]-net_amount.
+              DATA(lv_amopo) = ( lv_godva * 100 ) / lv_amoun.
+
+
+
+            ENDIF.
+
+
+
+
+
+
+
+
+
+            ls_msg-msgid = 'ZTM'.
+            ls_msg-msgno = 001.
+            ls_msg-msgty = /bobf/if_frw_c=>sc_change_failed_only.
+            ls_msg-msgv1 = 'Flete/Venta no superada, hay demandas que esperan al siguiente día hábil.'.
+
+            IF eo_message IS INITIAL.
+              eo_message = /bobf/cl_frw_factory=>get_message( ).
+            ENDIF.
+
+            eo_message->add_message(
+               EXPORTING
+                 is_msg       = ls_msg
+                 iv_node      = is_ctx-node_key
+                 iv_key       = ls_root-key
+                 iv_attribute = 'TOR_ID_TR'
+                     ).
+
+            ls_failed_key-key = ls_root-key.
+            APPEND ls_failed_key TO et_failed_key.
+
+          ENDIF.
+
+        CATCH cx_root INTO DATA(o_err).
+          DATA(lv_msg) = o_err->get_text( ).
+      ENDTRY.
+    ENDIF.
+  ENDMETHOD.
